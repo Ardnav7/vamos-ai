@@ -37,7 +37,10 @@ async function unlockWebAudioForIOS(): Promise<void> {
   try {
     const a = new Audio(SILENT_WAV);
     a.volume = 0.01;
-    await a.play();
+    await Promise.race([
+      a.play().catch(() => {}),
+      new Promise<void>((r) => setTimeout(r, 400)),
+    ]);
     a.pause();
     a.removeAttribute("src");
   } catch {
@@ -308,9 +311,9 @@ function VoiceLessonContent() {
     };
   }, []);
 
-  const handleStartLessonTap = async () => {
+  const handleStartLessonTap = () => {
     setErrorMessage(null);
-    await unlockWebAudioForIOS();
+    unlockWebAudioForIOS();
     setIntroGateOpen(true);
   };
 
@@ -368,6 +371,8 @@ function VoiceLessonContent() {
       formData.append("act", String(act));
       formData.append("transcript", JSON.stringify(transcript));
       formData.append("previousPhrases", previousPhrases);
+      const masteredPhrases = localStorage.getItem("vamos_mastered_phrases") || "";
+      formData.append("masteredPhrases", masteredPhrases);
 
       const response = await fetch("/api/voice/respond", {
         method: "POST",
