@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "VamosAI",
+    "slug": "vamosai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "vamosai",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#080C14"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.vamosai.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "VamosAI needs microphone access so you can practice speaking Spanish with Carlos."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#080C14"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.vamosai.app",
+      "permissions": ["RECORD_AUDIO"]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "VamosAI needs microphone access so you can practice speaking Spanish with Carlos."
+        }
+      ]
+    ]
+  }
+}
