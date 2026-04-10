@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, Suspense } from "react";
+import { useState, useEffect, useRef, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { posthog, initPostHog } from "@/lib/posthog";
 
@@ -12,12 +12,20 @@ type Status =
   | "processing"
   | "ended";
 
+/** WhatsApp / Instagram / FB in-app browsers often report maxTouchPoints === 0 but still need a user tap for audio. */
+function isEmbeddedOrInAppBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return /WhatsApp|Instagram|FBAN|FBAV|Line\/|Telegram|wv\)|WebView|CriOS/i.test(ua);
+}
+
 /** iOS Safari blocks programmatic audio until there is a user gesture; async fetch breaks the chain. */
 function isTouchLikeDevice(): boolean {
   if (typeof navigator === "undefined") return false;
   return (
     navigator.maxTouchPoints > 0 ||
-    /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+    /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+    isEmbeddedOrInAppBrowser()
   );
 }
 
@@ -79,8 +87,19 @@ function VoiceLessonContent() {
   const chunksRef = useRef<Blob[]>([]);
   const hasStartedRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+  const startAbortRef = useRef<AbortController | null>(null);
+
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  /** iOS / in-app browsers: play() after fetch often fails — second tap fixes it. */
+  const [pendingAudioBase64, setPendingAudioBase64] = useState<string | null>(null);
 
   const scenarioName = SCENARIO_NAMES[scenario] || scenario;
+
+  const tierForApi = (() => {
+    if (level === "conversational") return "confident";
+    if (level === "basics") return "comfortable";
+    return "survival";
+  })();
 
   useEffect(() => {
     initPostHog();
@@ -104,7 +123,9 @@ function VoiceLessonContent() {
     }
   };
 
-  const playAudioFromBase64 = (base64: string): Promise<void> => {
+  type PlayResult = "ok" | "autoplay_blocked";
+
+  const playAudioFromBase64 = useCallback((base64: string): Promise<PlayResult> => {
     return new Promise((resolve, reject) => {
       const audioBytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
       const blob = new Blob([audioBytes], { type: "audio/mpeg" });
@@ -112,73 +133,138 @@ function VoiceLessonContent() {
       const audio = new Audio(url);
       audioRef.current = audio;
       audio.setAttribute("playsinline", "");
+      audio.setAttribute("webkit-playsinline", "true");
       audio.preload = "auto";
       audio.onended = () => {
         URL.revokeObjectURL(url);
         audioRef.current = null;
-        resolve();
+        resolve("ok");
       };
       audio.onerror = (e) => {
         URL.revokeObjectURL(url);
         console.error("[voice-lesson] Audio playback error:", e);
         reject(e);
       };
-      audio.play().catch(reject);
+      audio.play().catch((err: unknown) => {
+        const name =
+          err && typeof err === "object" && "name" in err ? (err as { name: string }).name : "";
+        if (name === "NotAllowedError" || name === "AbortError") {
+          URL.revokeObjectURL(url);
+          audioRef.current = null;
+          resolve("autoplay_blocked");
+          return;
+        }
+        reject(err);
+      });
     });
+  }, []);
+
+  /** After autoplay_blocked, user taps — play() runs inside a real gesture. */
+  const playPendingAudioFromTap = async () => {
+    if (!pendingAudioBase64) return;
+    setErrorMessage(null);
+    const b64 = pendingAudioBase64;
+    setPendingAudioBase64(null);
+    setStatus("carlos-speaking");
+    try {
+      const r = await playAudioFromBase64(b64);
+      if (r === "autoplay_blocked") {
+        setPendingAudioBase64(b64);
+        setStatus("carlos-speaking");
+        return;
+      }
+      setStatus("your-turn");
+    } catch {
+      setPendingAudioBase64(b64);
+      setErrorMessage("Could not play audio. Try again or open in Safari/Chrome.");
+      setStatus("your-turn");
+    }
   };
 
-  useEffect(() => {
-    if (!introGateOpen) return;
+  const handleRetryStart = () => {
+    setErrorMessage(null);
+    const ac = new AbortController();
+    startAbortRef.current?.abort();
+    startAbortRef.current = ac;
+    void runStartLesson(ac.signal);
+  };
 
-    let cancelled = false;
-    stopAudio();
-
-    const startLesson = async () => {
+  const runStartLesson = useCallback(
+    async (signal: AbortSignal) => {
+      setErrorMessage(null);
+      setPendingAudioBase64(null);
       setStatus("loading");
       try {
         const response = await fetch("/api/voice/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scenario, name }),
+          body: JSON.stringify({ scenario, name, tier: tierForApi }),
+          signal,
         });
 
-        if (cancelled) return;
+        if (signal.aborted) return;
 
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
-          const msg = errData?.error ?? "Failed to start lesson";
+          const msg =
+            (errData?.error as string) ??
+            "Could not start the lesson. If this keeps happening, the server may be missing an API key.";
           console.error("[voice-lesson] API error:", msg);
-          if (!cancelled) setStatus("your-turn");
+          setErrorMessage(msg);
+          setStatus("idle");
           return;
         }
 
         const data = await response.json();
-        if (cancelled) return;
+        if (signal.aborted) return;
 
         setTranscript([{ role: "carlos", text: data.carlosText }]);
-        posthog.capture("session_started", { scenario, name });
-        const sayMatch = data.carlosText?.match(/(?:say|Say)\s*(?:just\s+)?(?:that\s+one\s+word\s+with\s+me:\s+)?([^.!?]+)/i);
+        try {
+          posthog.capture("session_started", { scenario, name });
+        } catch {
+          /* analytics optional */
+        }
+        const sayMatch = data.carlosText?.match(
+          /(?:say|Say)\s*(?:just\s+)?(?:that\s+one\s+word\s+with\s+me:\s+)?([^.!?]+)/i
+        );
         setCurrentPhrase(sayMatch ? sayMatch[1].trim() : "");
         setStatus("carlos-speaking");
 
-        await playAudioFromBase64(data.audioBase64);
-        if (cancelled) return;
+        const playResult = await playAudioFromBase64(data.audioBase64);
+        if (signal.aborted) return;
 
-        setStatus("your-turn");
-      } catch (err) {
-        if (!cancelled) {
-          console.error("[voice-lesson] Error:", err);
-          setStatus("your-turn");
+        if (playResult === "autoplay_blocked") {
+          setPendingAudioBase64(data.audioBase64);
+          return;
         }
+        setStatus("your-turn");
+      } catch (err: unknown) {
+        if (signal.aborted) return;
+        if (err && typeof err === "object" && "name" in err && (err as { name: string }).name === "AbortError") {
+          return;
+        }
+        console.error("[voice-lesson] Error:", err);
+        setErrorMessage("Something went wrong starting the lesson. Check your connection and try again.");
+        setStatus("idle");
       }
-    };
+    },
+    [scenario, name, tierForApi, playAudioFromBase64]
+  );
 
-    startLesson();
+  useEffect(() => {
+    if (!introGateOpen) return;
+
+    stopAudio();
+    const ac = new AbortController();
+    startAbortRef.current = ac;
+    void runStartLesson(ac.signal);
+
     return () => {
-      cancelled = true;
+      ac.abort();
+      startAbortRef.current = null;
       stopAudio();
     };
-  }, [introGateOpen, scenario, name, level]);
+  }, [introGateOpen, runStartLesson]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -223,6 +309,7 @@ function VoiceLessonContent() {
   }, []);
 
   const handleStartLessonTap = async () => {
+    setErrorMessage(null);
     await unlockWebAudioForIOS();
     setIntroGateOpen(true);
   };
@@ -292,6 +379,7 @@ function VoiceLessonContent() {
       if (!response.ok) {
         const msg = data?.error ?? "Failed to get response";
         console.error("[voice-lesson] API error:", msg);
+        setErrorMessage(msg);
         setStatus("your-turn");
         return;
       }
@@ -305,7 +393,11 @@ function VoiceLessonContent() {
       setCurrentPhrase("");
       setStatus("carlos-speaking");
 
-      await playAudioFromBase64(data.audioBase64);
+      const playResult = await playAudioFromBase64(data.audioBase64);
+      if (playResult === "autoplay_blocked") {
+        setPendingAudioBase64(data.audioBase64);
+        return;
+      }
 
       setStatus("your-turn");
     } catch (err) {
@@ -385,6 +477,9 @@ function VoiceLessonContent() {
   };
 
   const getStatusText = () => {
+    if (pendingAudioBase64) {
+      return "Your browser blocked autoplay — tap below to hear Carlos.";
+    }
     switch (status) {
       case "idle":
         return "Tap the button below to start";
@@ -441,6 +536,32 @@ function VoiceLessonContent() {
           C
         </div>
         <p className="text-slate-400 text-lg mb-4 text-center">{getStatusText()}</p>
+
+        {errorMessage && (
+          <p className="text-amber-400/90 text-sm text-center mb-3 max-w-md mx-auto px-2">
+            {errorMessage}
+          </p>
+        )}
+
+        {errorMessage && status === "idle" && introGateOpen && (
+          <button
+            type="button"
+            onClick={handleRetryStart}
+            className="mb-4 px-6 py-3 rounded-xl border border-brand text-brand font-semibold hover:bg-brand/10 transition-colors"
+          >
+            Try again
+          </button>
+        )}
+
+        {pendingAudioBase64 && (
+          <button
+            type="button"
+            onClick={playPendingAudioFromTap}
+            className="mb-8 px-8 py-4 rounded-xl bg-brand text-white font-semibold hover:bg-brand-hover transition-colors shadow-[0_0_30px_var(--brand-glow)]"
+          >
+            Tap to hear Carlos
+          </button>
+        )}
 
         {touchLike && !introGateOpen && (
           <button
